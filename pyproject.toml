@@ -1,14 +1,16 @@
 [project]
 name = "example_app"
 authors = [
-    { name = "mates", email = "mates@sez.cy"}
+    { name = "Your Name", email = "your.email@example.com"}
 ]
-description = "Test"
+description = "1D Cutting Optimizer for ERPNext"
 requires-python = ">=3.10"
 readme = "README.md"
 dynamic = ["version"]
 dependencies = [
     # "frappe~=15.0.0" # Installed and managed by bench.
+    "reportlab>=4.0.0",
+    "ortools>=9.0.0"
 ]
 
 [build-system]

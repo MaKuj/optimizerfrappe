@@ -1,0 +1,8 @@
+{
+  "example_app": {
+    "resolution": {
+      "branch": "main",
+      "repo_url": "https://github.com/yourusername/erpnext-cutting-optimizer"
+    }
+  }
+} 

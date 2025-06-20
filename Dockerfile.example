@@ -1,0 +1,13 @@
+FROM frappe/erpnext:latest
+
+# Copy apps.json to temp directory
+COPY apps.json /tmp/apps.json
+
+# Install custom app
+RUN install-app example_app
+
+# Install required Python packages for the app
+RUN pip install reportlab ortools
+
+# Set the default command
+CMD ["start"] 

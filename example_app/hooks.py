@@ -1,8 +1,8 @@
 app_name = "example_app"
-app_title = "Test"
-app_publisher = "mates"
-app_description = "Test"
-app_email = "mates@sez.cy"
+app_title = "Cutting Optimizer"
+app_publisher = "ealu.pl"
+app_description = "1D Cutting Optimizer for ERPNext"
+app_email = "ealu@ealu.pl"
 app_license = "mit"
 
 # Apps
@@ -43,7 +43,9 @@ app_license = "mit"
 # page_js = {"page" : "public/js/file.js"}
 
 # include js in doctype views
-# doctype_js = {"doctype" : "public/js/doctype.js"}
+doctype_js = {
+    "Sales Order": "public/js/sales_order_optimizer_client.js"
+}
 # doctype_list_js = {"doctype" : "public/js/doctype_list.js"}
 # doctype_tree_js = {"doctype" : "public/js/doctype_tree.js"}
 # doctype_calendar_js = {"doctype" : "public/js/doctype_calendar.js"}
@@ -174,71 +176,12 @@ app_license = "mit"
 # Overriding Methods
 # ------------------------------
 #
-# override_whitelisted_methods = {
-# 	"frappe.desk.doctype.event.event.get_events": "example_app.event.get_events"
-# }
+override_whitelisted_methods = {
+#	"frappe.desk.doctype.event.event.get_events": "example_app.event.get_events"
+}
+
+whitelisted_methods = [
+	"example_app.erpnextcutting_optimizer.api.enqueue_optimization_job"
+]
 #
-# each overriding function accepts a `data` argument;
-# generated from the base implementation of the doctype dashboard,
-# along with any modifications made in other Frappe apps
-# override_doctype_dashboards = {
-# 	"Task": "example_app.task.get_dashboard_data"
-# }
-
-# exempt linked doctypes from being automatically cancelled
-#
-# auto_cancel_exempted_doctypes = ["Auto Repeat"]
-
-# Ignore links to specified DocTypes when deleting documents
-# -----------------------------------------------------------
-
-# ignore_links_on_delete = ["Communication", "ToDo"]
-
-# Request Events
-# ----------------
-# before_request = ["example_app.utils.before_request"]
-# after_request = ["example_app.utils.after_request"]
-
-# Job Events
-# ----------
-# before_job = ["example_app.utils.before_job"]
-# after_job = ["example_app.utils.after_job"]
-
-# User Data Protection
-# --------------------
-
-# user_data_fields = [
-# 	{
-# 		"doctype": "{doctype_1}",
-# 		"filter_by": "{filter_by}",
-# 		"redact_fields": ["{field_1}", "{field_2}"],
-# 		"partial": 1,
-# 	},
-# 	{
-# 		"doctype": "{doctype_2}",
-# 		"filter_by": "{filter_by}",
-# 		"partial": 1,
-# 	},
-# 	{
-# 		"doctype": "{doctype_3}",
-# 		"strict": False,
-# 	},
-# 	{
-# 		"doctype": "{doctype_4}"
-# 	}
-# ]
-
-# Authentication and authorization
-# --------------------------------
-
-# auth_hooks = [
-# 	"example_app.auth.validate"
-# ]
-
-# Automatically update python controller files with type annotations for this app.
-# export_python_type_annotations = True
-
-# default_log_clearing_doctypes = {
-# 	"Logging DocType Name": 30  # days to retain logs
-# }
-
+# each overriding function accepts a `data`

@@ -3,5 +3,16 @@
 *.egg-info
 *.swp
 tags
-node_modules
+example_app/docs/current
 __pycache__
+dist/
+build/
+.vscode
+.idea
+node_modules
+.pytest_cache
+.coverage
+.env
+venv/
+.venv/
+env/
