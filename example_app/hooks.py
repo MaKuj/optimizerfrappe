@@ -84,8 +84,8 @@ doctype_js = {
 # Installation
 # ------------
 
-# before_install = "example_app.install.before_install"
-# after_install = "example_app.install.after_install"
+before_install = "example_app.setup.before_install"
+after_install = "example_app.setup.after_install"
 
 # Uninstallation
 # ------------
