@@ -241,18 +241,23 @@ def run_full_optimization_job(sales_order_name, config, user):
 
             stock_data = {item_code: {"length": profile_config["stock_length_mm"]}}
             parts_data = profile_config["parts"]
-            saw_kerf = profile_config.get("saw_kerf_mm", 1)
+            saw_kerf = config.get("settings", {}).get("saw_kerf", 1)
             allow_overproduction = config.get("settings", {}).get("allow_overproduction", False)
 
             solution = run_1d_optimizer(stock_data, parts_data, saw_kerf, allow_overproduction=allow_overproduction)
 
             if solution:
-                # Generate and attach the PDF for this specific profile
-                _generate_and_attach_profile_pdf(sales_order_name, item_code, profile_config, solution)
+                _generate_and_attach_profile_pdf(sales_order_name, item_code, profile_config, solution, saw_kerf)
 
-                # Store the required quantity for the final SO update
-                qty_needed = solution.get("total_stock_items_used", {}).get(item_code, 0)
-                updated_quantities[item_code] = qty_needed
+                # Store the solution back into the config object for this profile
+                profile_config['solution'] = solution
+                
+                # Calculate total length in meters and store for SO update
+                stock_length_mm = profile_config.get("stock_length_mm", 0)
+                qty_needed_in_pieces = solution.get("total_stock_items_used", {}).get(item_code, 0)
+                total_length_in_meters = (qty_needed_in_pieces * stock_length_mm) / 1000.0
+                updated_quantities[item_code] = total_length_in_meters
+                
             else:
                 has_errors = True
                 frappe.log_error(f"No feasible solution found for profile {item_code}.", "Optimizer Job Warning")
@@ -263,7 +268,7 @@ def run_full_optimization_job(sales_order_name, config, user):
         # --- Final Step: Update Sales Order item quantities ---
         frappe.publish_realtime("update_job_status", {"job_id": job_id, "status": "running", "progress": 90, "message": "Updating Sales Order..."})
         if updated_quantities:
-            _update_sales_order_items(sales_order_name, updated_quantities)
+            _update_sales_order_items(sales_order_name, updated_quantities, config)
 
     except Exception as e:
         frappe.log_error(frappe.get_traceback(), "Full Optimization Job Failed")
@@ -274,7 +279,7 @@ def run_full_optimization_job(sales_order_name, config, user):
     frappe.publish_realtime("update_job_status", {"job_id": job_id, "status": "complete", "result": result})
 
 
-def _update_sales_order_items(doc_name, quantities_map):
+def _update_sales_order_items(doc_name, quantities_map, final_config=None):
     """Updates the quantities of specified items in a Sales Order."""
     so_doc = frappe.get_doc("Sales Order", doc_name)
     updated = False
@@ -285,12 +290,20 @@ def _update_sales_order_items(doc_name, quantities_map):
                 item.qty = new_qty
                 updated = True
     
+    if final_config:
+        try:
+            config_json = json.dumps(final_config, indent=2, sort_keys=True, default=str)
+            so_doc.custom_optimizer_output = config_json
+            updated = True
+        except Exception as e:
+            frappe.log_error(f"Failed to serialize solution data for Optimizer Output: {e}", "Optimizer JSON Error")
+
     if updated:
         so_doc.save(ignore_permissions=True)
         frappe.db.commit()
 
 
-def _generate_and_attach_profile_pdf(doc_name, item_code, profile_config, solution):
+def _generate_and_attach_profile_pdf(doc_name, item_code, profile_config, solution, saw_kerf):
     """
     Generates and attaches a PDF report for a single profile's optimization solution.
     """
@@ -302,7 +315,7 @@ def _generate_and_attach_profile_pdf(doc_name, item_code, profile_config, soluti
         all_patterns_dict=prepared_data["patterns"],
         solution_details_list=[prepared_data["solution_details"]],
         parts_production_summary_list=prepared_data["production_summary"],
-        saw_kerf=profile_config.get("saw_kerf_mm", 1)
+        saw_kerf=saw_kerf
     )
     
     pdf_buffer = pdf_gen.generate_pdf()
@@ -437,17 +450,18 @@ def update_so_with_solution(solution_data, all_patterns_dict, original_docname):
     """
     so = frappe.get_doc("Sales Order", original_docname)
 
-    # Don't clear the existing items - this was causing the issue
-    # Instead, we'll create a PDF report only
-    
-    # Check if we should attempt to update the Sales Order items
-    update_items = False
+    # --- Update the Optimizer Output field with the new solution ---
+    try:
+        solution_json = json.dumps(solution_data, indent=2, sort_keys=True)
+        so.custom_optimizer_output = solution_json
+    except Exception as e:
+        frappe.log_error(f"Failed to serialize solution data for Optimizer Output: {e}", "Optimizer JSON Error")
+
+    update_items = True
     
     if update_items:
-        # Clear the existing items table which contains the finished parts
         so.set("items", [])
     
-        # --- Build the new items table from the solution's raw material requirements ---
         stock_used = solution_data.get('total_stock_items_used', {})
         for item_code, qty in stock_used.items():
             if qty > 0:
