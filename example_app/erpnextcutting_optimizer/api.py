@@ -7,41 +7,12 @@ from ortools.sat.python import cp_model
 from datetime import datetime
 import re
 import copy
-from .pdf_generator_1d import export_solution_to_pdf_1d # Assuming pdf_generator_1d is in the same directory
 from .optimizer_core import run_1d_optimizer
 from .pdf_generator_1d import OneDCuttingPDFGenerator
 
 # ==============================================================================
 # 1. ENQUEUEING METHOD (WHITELISTED)
 # ==============================================================================
-
-@frappe.whitelist()
-def enqueue_optimization_job(data):
-    """
-    This is the whitelisted function called from the client-side script.
-    It enqueues the actual optimization job to run in the background.
-    The 'data' argument is a dictionary sent from the client.
-    """
-    # The data arrives as a JSON string, so we need to parse it first.
-    if isinstance(data, str):
-        data = json.loads(data)
-
-    # The background job will need the docname and doctype for attachments,
-    # and the rest of the data as a JSON string.
-    docname = data.get("sales_order_name")
-    if not docname:
-        frappe.throw(_("Sales Order name not provided."))
-
-    job = frappe.enqueue(
-        "example_app.erpnextcutting_optimizer.api.run_optimization_job",
-        queue='long',
-        timeout=1500,
-        doctype="Sales Order", # Doctype is always Sales Order for this call
-        docname=docname,
-        request_data_json=json.dumps(data), # Pass the whole data dict
-        user=frappe.session.user
-    )
-    return {"job_id": job.id}
 
 @frappe.whitelist()
 def get_job_result(job_id):
@@ -100,123 +71,6 @@ def enqueue_full_optimization(sales_order_name, config):
 # ==============================================================================
 # 2. BACKGROUND JOB
 # ==============================================================================
-
-def run_optimization_job(doctype, docname, request_data_json, user):
-    """
-    This function runs in the background. It performs the optimization,
-    creates the necessary documents, and notifies the user.
-    """
-    try:
-        # Avoid long log messages that exceed character limits
-        frappe.log_error("Optimizer job started.", "Optimizer Debug Trace")
-        
-        request_data = json.loads(request_data_json)
-        # Don't log the entire request data as it can be too long
-        frappe.log_error("Request data loaded successfully", "Optimizer Debug Trace")
-        
-        # Use a specific output directory within the site's private files
-        output_dir = os.path.join(frappe.utils.get_site_path(), "private", "files", "optimizer_output")
-        os.makedirs(output_dir, exist_ok=True)
-        frappe.log_error(f"Output directory set to: {output_dir}", "Optimizer Debug Trace")
-
-        # Add detailed logging for the input data
-        try:
-            # Use frappe.log_message to have a separate title (max 140 chars) and long content.
-            log_content = (
-                f"Stock Data:\n{json.dumps(request_data.get('stock'), indent=2)}\n\n"
-                f"Parts Data:\n{json.dumps(request_data.get('parts'), indent=2)}"
-            )
-            frappe.log_message(log_content, "Optimizer Input Data")
-        except Exception as e:
-            # Fallback logging with a short title if the main logging fails
-            frappe.log_error(f"Failed to serialize and log input data: {e}", "Optimizer Logging Error")
-
-        # Step 1: Run the core 1D Optimizer
-        frappe.log_error("Running 1D optimizer...", "Optimizer Debug Trace")
-        solution_data, pdf_path, all_patterns_dict = run_1d_optimizer(
-            stock_data=request_data['stock'],
-            parts_data=[{'name': name, **data} for name, data in request_data['parts'].items()],
-            saw_kerf=request_data['saw_kerf'],
-            project_description=request_data['project_description'],
-            output_dir_base=output_dir,
-            allow_overproduction=request_data.get('allow_overproduction', False)
-        )
-        frappe.log_error(f"Optimizer finished. Solution found: {'Yes' if solution_data else 'No'}", "Optimizer Debug Trace")
-
-        if not solution_data:
-            # If no solution, we should still return something to the job caller.
-            frappe.log_error("Optimization did not find a solution.", "Optimizer Error")
-            # The 'return' here sets the 'output' of the JobLog document.
-            return {"status": "failed", "message": "Optimization failed to find a feasible solution."}
-
-        # Step 2: Update the original Sales Order with the solution
-        # Note: This step is now optional and disabled by default
-        try:
-            frappe.log_error("Updating original Sales Order...", "Optimizer Debug Trace")
-            update_so_with_solution(
-                solution_data=solution_data,
-                all_patterns_dict=all_patterns_dict,
-                original_docname=docname # This is the Sales Order name
-            )
-            frappe.log_error(f"Sales Order {docname} updated.", "Optimizer Debug Trace")
-        except Exception as e:
-            frappe.log_error(f"Error updating Sales Order: {str(e)}\n{frappe.get_traceback()}", "Optimizer Error")
-            # Continue with PDF attachment even if updating Sales Order fails
-
-        # Step 3: Attach the generated PDF back to the original Sales Order
-        frappe.log_error("Attaching PDF to Sales Order...", "Optimizer Debug Trace")
-        if pdf_path and os.path.exists(pdf_path):
-            try:
-                frappe.log_error(f"PDF path exists: {pdf_path}", "Optimizer Debug Trace")
-                with open(pdf_path, 'rb') as pdf_file:
-                    file_content = pdf_file.read()
-                    
-                frappe.log_error(f"PDF file read, size: {len(file_content)} bytes", "Optimizer Debug Trace")
-                
-                file_doc = frappe.new_doc("File")
-                file_doc.file_name = os.path.basename(pdf_path)
-                file_doc.attached_to_doctype = doctype
-                file_doc.attached_to_name = docname
-                file_doc.file_url = f"/private/files/{os.path.basename(pdf_path)}"
-                file_doc.content = file_content
-                file_doc.is_private = 1
-                file_doc.save(ignore_permissions=True)
-                
-                frappe.log_error(f"File document created with ID: {file_doc.name}", "Optimizer Debug Trace")
-                
-                # Clean up the local PDF file
-                os.remove(pdf_path)
-                frappe.log_error("PDF attached successfully and local file removed.", "Optimizer Debug Trace")
-            except Exception as e:
-                frappe.log_error(f"Error attaching PDF: {str(e)}\n{frappe.get_traceback()}", "Optimizer Error")
-        else:
-            frappe.log_error(f"PDF not found or not created. Path: {pdf_path}, Exists: {os.path.exists(pdf_path) if pdf_path else False}", "Optimizer Debug Trace")
-
-        # Step 4: Notify the user of success - removed 'indicator' parameter
-        frappe.log_error("Sending success notification.", "Optimizer Debug Trace")
-        frappe.publish_realtime(
-            event="show_alert",
-            message=_("Optimization complete. Sales Order <a href='/app/sales-order/{0}'>{0}</a> has been updated with the cutting plan.").format(docname),
-            user=user
-        )
-        frappe.log_error("Job completed successfully.", "Optimizer Debug Trace")
-        
-        # This return value will be stored in the JobLog's 'output' field.
-        return solution_data
-
-    except Exception as e:
-        # Log the full traceback to the error log
-        frappe.log_error(f"Optimization failed: {str(e)}\n{frappe.get_traceback()}", "Optimizer Job Failed")
-        
-        # Step 5: Notify the user of failure - removed 'indicator' parameter
-        frappe.publish_realtime(
-            event="show_alert",
-            message=_("Optimization failed for Sales Order {0}. See Error Log for details.").format(docname),
-            user=user
-        )
-        
-        # Also return the error message in the job output.
-        return {"status": "error", "message": str(e)}
 
 def run_full_optimization_job(sales_order_name, config, user):
     """
@@ -439,48 +293,6 @@ def _attach_pdf_to_document(pdf_buffer, doc_name, file_name):
     file_doc.content = pdf_buffer.getvalue()
     file_doc.is_private = 1
     file_doc.insert(ignore_permissions=True)
-
-# ==============================================================================
-# 3. SALES ORDER UPDATE LOGIC
-# ==============================================================================
-
-def update_so_with_solution(solution_data, all_patterns_dict, original_docname):
-    """
-    Updates the original Sales Order with the raw materials from the solution.
-    """
-    so = frappe.get_doc("Sales Order", original_docname)
-
-    # --- Update the Optimizer Output field with the new solution ---
-    try:
-        solution_json = json.dumps(solution_data, indent=2, sort_keys=True)
-        so.custom_optimizer_output = solution_json
-    except Exception as e:
-        frappe.log_error(f"Failed to serialize solution data for Optimizer Output: {e}", "Optimizer JSON Error")
-
-    update_items = True
-    
-    if update_items:
-        so.set("items", [])
-    
-        stock_used = solution_data.get('total_stock_items_used', {})
-        for item_code, qty in stock_used.items():
-            if qty > 0:
-                # Check if the item exists in the database before adding it
-                if frappe.db.exists("Item", item_code):
-                    so.append("items", {
-                        "item_code": item_code,
-                        "qty": qty,
-                        # Any other fields you want to set, e.g., rate, warehouse
-                        # "warehouse": so.set_warehouse, # Inherit from SO header if needed
-                    })
-                else:
-                    frappe.log_error(f"Item {item_code} not found in the database. Skipping.", "Optimizer Item Error")
-        
-        # Save the updated sales order
-        so.save(ignore_permissions=True)
-        frappe.db.commit()
-    
-    return so.name
 
 # =================================================================================================
 # 4. CORE OPTIMIZER LOGIC (Placeholder - This should be in its own file)

@@ -185,3 +185,112 @@ fixtures = ["Custom Field"]
 whitelisted_methods = [
 	"example_app.erpnextcutting_optimizer.api.enqueue_optimization_job"
 ]
+
+# Integration Events
+# ------------------
+# Hook on document methods and events
+
+# doc_events = {
+# 	"*": {
+# 		"on_update": "method",
+# 		"on_cancel": "method",
+# 		"on_trash": "method"
+# 	}
+# }
+
+# Scheduled Tasks
+# ---------------
+
+# scheduler_events = {
+# 	"all": [
+# 		"example_app.tasks.all"
+# 	],
+# 	"daily": [
+# 		"example_app.tasks.daily"
+# 	],
+# 	"hourly": [
+# 		"example_app.tasks.hourly"
+# 	],
+# 	"weekly": [
+# 		"example_app.tasks.weekly"
+# 	],
+# 	"monthly": [
+# 		"example_app.tasks.monthly"
+# 	],
+# }
+
+# Testing
+# -------
+
+# before_tests = "example_app.install.before_tests"
+
+# Overriding Methods
+# ------------------------------
+#
+# override_whitelisted_methods = {
+# 	"frappe.desk.doctype.event.event.get_events": "example_app.event.get_events"
+# }
+#
+# each overriding function accepts a `data` argument;
+# generated from the base implementation of the doctype dashboard,
+# along with any modifications made in other Frappe apps
+# override_doctype_dashboards = {
+# 	"Task": "example_app.task.get_dashboard_data"
+# }
+
+# exempt linked doctypes from being automatically cancelled
+#
+# auto_cancel_exempted_doctypes = ["Auto Repeat"]
+
+# Ignore links to specified DocTypes when deleting documents
+# -----------------------------------------------------------
+
+# ignore_links_on_delete = ["Communication", "ToDo"]
+
+# Request Events
+# ----------------
+# before_request = ["example_app.utils.before_request"]
+# after_request = ["example_app.utils.after_request"]
+
+# Job Events
+# ----------
+# before_job = ["example_app.utils.before_job"]
+# after_job = ["example_app.utils.after_job"]
+
+# User Data Protection
+# --------------------
+
+# user_data_fields = [
+# 	{
+# 		"doctype": "{doctype_1}",
+# 		"filter_by": "{filter_by}",
+# 		"redact_fields": ["{field_1}", "{field_2}"],
+# 		"partial": 1,
+# 	},
+# 	{
+# 		"doctype": "{doctype_2}",
+# 		"filter_by": "{filter_by}",
+# 		"partial": 1,
+# 	},
+# 	{
+# 		"doctype": "{doctype_3}",
+# 		"strict": False,
+# 	},
+# 	{
+# 		"doctype": "{doctype_4}"
+# 	}
+# ]
+
+# Authentication and authorization
+# --------------------------------
+
+# auth_hooks = [
+# 	"example_app.auth.validate"
+# ]
+
+# Automatically update python controller files with type annotations for this app.
+# export_python_type_annotations = True
+
+# default_log_clearing_doctypes = {
+# 	"Logging DocType Name": 30  # days
+# }
