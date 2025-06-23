@@ -180,8 +180,8 @@ override_whitelisted_methods = {
 #	"frappe.desk.doctype.event.event.get_events": "example_app.event.get_events"
 }
 
+fixtures = ["Custom Field"]
+
 whitelisted_methods = [
 	"example_app.erpnextcutting_optimizer.api.enqueue_optimization_job"
 ]
-#
-# each overriding function accepts a `data`
