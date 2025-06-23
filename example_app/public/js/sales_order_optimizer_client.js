@@ -177,6 +177,24 @@ async function show_master_optimizer_dialog(frm) {
 
     render_profiles_html(dialog, frm, config);
     dialog.show();
+
+    // Add a "Reset" button after the dialog is shown.
+    dialog.add_custom_action(__('Reset Optimizer'), () => {
+        frappe.confirm(
+            __('This will clear all optimization solutions from this Sales Order. Are you sure?'),
+            () => {
+                for (const item_code in config.profiles) {
+                    if (config.profiles[item_code].solution) {
+                        delete config.profiles[item_code].solution;
+                    }
+                }
+                save_config_to_form(frm, config);
+                frappe.show_alert({ message: 'Optimizer has been reset.', indicator: 'green' });
+                dialog.hide();
+                frm.reload_doc(); // Reload the form to reflect the cleared state.
+            }
+        );
+    });
 }
 
 /**
@@ -199,7 +217,7 @@ function render_profiles_html(dialog, frm, config) {
                 </tr>
             </thead>
             <tbody>
-                ${Object.keys(config.profiles).map(item_code => {
+                ${Object.keys(config.profiles).filter(item_code => item_code !== 'OP-CUT').map(item_code => {
                     const profile = config.profiles[item_code];
                     const total_parts = profile.parts.reduce((sum, part) => sum + part.demand, 0);
                     const summary = total_parts > 0 

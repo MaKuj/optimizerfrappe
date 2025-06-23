@@ -86,6 +86,7 @@ def run_full_optimization_job(sales_order_name, config, user):
         profiles_to_run = config.get("profiles", {})
         total_profiles = len(profiles_to_run)
         updated_quantities = {}
+        total_cuts = 0
 
         # --- Main Loop: Optimize and Generate PDF for each profile ---
         for i, item_code in enumerate(profiles_to_run):
@@ -106,6 +107,12 @@ def run_full_optimization_job(sales_order_name, config, user):
                 # Store the solution back into the config object for this profile
                 profile_config['solution'] = solution
                 
+                # Sum up the total number of cuts from the current solution
+                profile_cuts = 0
+                for pattern in solution.get("patterns", []):
+                    profile_cuts += pattern.get('num_cuts_in_pattern', 0) * pattern.get('usage_count', 1)
+                total_cuts += profile_cuts
+                
                 # Calculate total length in meters and store for SO update
                 stock_length_mm = profile_config.get("stock_length_mm", 0)
                 qty_needed_in_pieces = solution.get("total_stock_items_used", {}).get(item_code, 0)
@@ -121,8 +128,8 @@ def run_full_optimization_job(sales_order_name, config, user):
 
         # --- Final Step: Update Sales Order item quantities ---
         frappe.publish_realtime("update_job_status", {"job_id": job_id, "status": "running", "progress": 90, "message": "Updating Sales Order..."})
-        if updated_quantities:
-            _update_sales_order_items(sales_order_name, updated_quantities, config)
+        if updated_quantities or total_cuts > 0:
+            _update_sales_order_items(sales_order_name, updated_quantities, config, total_cuts=total_cuts)
 
     except Exception as e:
         frappe.log_error(frappe.get_traceback(), "Full Optimization Job Failed")
@@ -133,17 +140,35 @@ def run_full_optimization_job(sales_order_name, config, user):
     frappe.publish_realtime("update_job_status", {"job_id": job_id, "status": "complete", "result": result})
 
 
-def _update_sales_order_items(doc_name, quantities_map, final_config=None):
+def _update_sales_order_items(doc_name, quantities_map, final_config=None, total_cuts=0):
     """Updates the quantities of specified items in a Sales Order."""
     so_doc = frappe.get_doc("Sales Order", doc_name)
     updated = False
+    op_cut_item_found = False
     for item in so_doc.items:
         if item.item_code in quantities_map:
             new_qty = quantities_map[item.item_code]
             if item.qty != new_qty:
                 item.qty = new_qty
                 updated = True
+        
+        if item.item_code == "OP-CUT":
+            op_cut_item_found = True
+            if item.qty != total_cuts:
+                item.qty = total_cuts
+                updated = True
     
+    # If OP-CUT item doesn't exist and there are cuts, add it as a new line.
+    # Note: The item 'OP-CUT' must exist in the system as a non-stock item.
+    if not op_cut_item_found and total_cuts > 0:
+        so_doc.append("items", {
+            "item_code": "OP-CUT",
+            "qty": total_cuts,
+            "rate": 0,
+            "uom": "ks"
+        })
+        updated = True
+
     if final_config:
         try:
             config_json = json.dumps(final_config, indent=2, sort_keys=True, default=str)
@@ -246,6 +271,11 @@ def _prepare_single_profile_for_pdf(solution, profile_config, item_code):
 
     stats['total_weight_waste_kg'] = stats['total_weight_all_stock_used_kg'] - stats['total_weight_all_parts_produced_kg'] - stats['total_weight_kerf_kg']
     
+    if stats['total_length_all_stock_used_mm'] > 0:
+        stats['yield_percentage'] = (stats['total_length_all_parts_produced_mm'] / stats['total_length_all_stock_used_mm']) * 100
+    else:
+        stats['yield_percentage'] = 0
+
     solution_details_for_pdf = {
         'total_stock_items_used': solution.get('total_stock_items_used'),
         'total_parts_produced': solution.get('total_parts_produced'),

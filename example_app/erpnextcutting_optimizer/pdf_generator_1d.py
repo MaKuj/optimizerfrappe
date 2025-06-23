@@ -76,6 +76,7 @@ class OneDCuttingPDFGenerator:
         
         summary_items = [
             ("Total Stock Cost:", f"{details.get('total_stock_cost', 0):.2f}"),
+            ("Yield:", f"{details.get('yield_percentage', 0):.2f} %"),
             ("Unique Patterns Used:", len(details.get('pattern_usage', {}))),
             ("Total Parts Length:", f"{details.get('total_length_all_parts_produced_mm', 0):.0f} mm"),
             ("Total Stock Used Length:", f"{details.get('total_length_all_stock_used_mm', 0):.0f} mm"),

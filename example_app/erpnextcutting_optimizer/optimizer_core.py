@@ -118,19 +118,35 @@ def _add_pattern_if_new(current_yield, layout_details, generated_patterns, patte
     pattern_hashes.add(yield_tuple)
     
     total_parts_len = sum(part['length'] for part in layout_details)
-    num_cuts = len(layout_details)
+    # The number of cuts is the number of pieces produced from the stock.
+    num_cuts = len(layout_details) if layout_details else 0
+    
+    # Total kerf is based on the number of cuts separating the pieces.
+    # If there are N pieces, there are (N-1) cuts between them. 
+    # The Nth cut separates the last piece from the remnant.
+    total_kerf_len = (num_cuts -1) * saw_kerf if num_cuts > 0 else 0
+
+    # We need to account for the final cut's kerf only if it doesn't "cut into" the usable remnant.
+    # This is a complex calculation; a simpler heuristic is to count cuts as pieces.
+    # The logic below was flawed. Let's simplify.
+    
     total_kerf_len = num_cuts * saw_kerf
     
-    # Correct waste calculation considers that the last part doesn't always need a kerf cut from the remnant
-    if layout_details:
-        total_used = total_parts_len + (num_cuts - 1) * saw_kerf
-        if total_used + saw_kerf < stock_length:
-             total_kerf_len = num_cuts * saw_kerf
-        else:
-            total_kerf_len = (num_cuts -1) * saw_kerf
-    
+    # Correct waste calculation
     total_used_len = total_parts_len + total_kerf_len
     waste = stock_length - total_used_len
+    
+    # It's impossible to have negative waste. If we do, the pattern is invalid.
+    if waste < 0:
+        # This can happen if the last kerf is not actually needed.
+        # Let's re-evaluate with one less kerf.
+        total_kerf_len = (num_cuts - 1) * saw_kerf if num_cuts > 0 else 0
+        total_used_len = total_parts_len + total_kerf_len
+        waste = stock_length - total_used_len
+        # If waste is still negative, this pattern is truly invalid.
+        if waste < 0:
+            return
+
 
     generated_patterns.append({
         'pattern_id': f"pat_{len(generated_patterns)}",
