@@ -1,4 +1,3 @@
-# example_app/erpnextcutting_optimizer/api.py
 import frappe
 import json
 import os
@@ -9,27 +8,94 @@ from datetime import datetime
 import re
 import copy
 from .pdf_generator_1d import export_solution_to_pdf_1d # Assuming pdf_generator_1d is in the same directory
+from .optimizer_core import run_1d_optimizer
+from .pdf_generator_1d import OneDCuttingPDFGenerator
 
 # ==============================================================================
 # 1. ENQUEUEING METHOD (WHITELISTED)
 # ==============================================================================
 
 @frappe.whitelist()
-def enqueue_optimization_job(doctype, docname, request_data_json):
+def enqueue_optimization_job(data):
     """
     This is the whitelisted function called from the client-side script.
     It enqueues the actual optimization job to run in the background.
+    The 'data' argument is a dictionary sent from the client.
     """
-    frappe.enqueue(
+    # The data arrives as a JSON string, so we need to parse it first.
+    if isinstance(data, str):
+        data = json.loads(data)
+
+    # The background job will need the docname and doctype for attachments,
+    # and the rest of the data as a JSON string.
+    docname = data.get("sales_order_name")
+    if not docname:
+        frappe.throw(_("Sales Order name not provided."))
+
+    job = frappe.enqueue(
         "example_app.erpnextcutting_optimizer.api.run_optimization_job",
         queue='long',
         timeout=1500,
-        doctype=doctype,
+        doctype="Sales Order", # Doctype is always Sales Order for this call
         docname=docname,
-        request_data_json=request_data_json,
+        request_data_json=json.dumps(data), # Pass the whole data dict
         user=frappe.session.user
     )
-    frappe.msgprint(_("Optimization job has been started. You will be notified upon completion."), alert=True)
+    return {"job_id": job.id}
+
+@frappe.whitelist()
+def get_job_result(job_id):
+	"""
+	Polls the RQ Job for the result of a background job.
+	This is a whitelisted method to securely get the job result from the client.
+	"""
+	try:
+		# The correct doctype for background jobs is "RQ Job"
+		job = frappe.get_doc("RQ Job", job_id)
+		
+		# We need to access the underlying RQ Job object to get the result.
+		# The .job property was added in the load_from_db method of the RQJob class
+		rq_job_instance = job.job 
+		job_output = rq_job_instance.result
+
+		if job.status == "finished" and job_output:
+			try:
+				if isinstance(job_output, str):
+					job_output = json.loads(job_output)
+			except (json.JSONDecodeError, TypeError):
+				pass
+
+		return {
+			"status": job.status,
+			"output": job_output,
+			"error": job.exc_info
+		}
+	except Exception as e:
+		frappe.log_error(frappe.get_traceback(), "Error in get_job_result")
+		return {"status": "error", "error": str(e)}
+
+@frappe.whitelist()
+def enqueue_full_optimization(sales_order_name, config):
+    """
+    Receives the entire optimization configuration from the client and enqueues
+    the main background job.
+    """
+    if not sales_order_name or not config:
+        return {"error": "Missing sales_order_name or config."}
+
+    # The config might come in as a string, ensure it's a dict
+    if isinstance(config, str):
+        config = json.loads(config)
+
+    job = frappe.enqueue(
+        "example_app.erpnextcutting_optimizer.api.run_full_optimization_job",
+        queue='long',
+        timeout=1500,
+        sales_order_name=sales_order_name,
+        config=config,
+        user=frappe.session.user
+    )
+    return {"job_id": job.id}
 
 # ==============================================================================
 # 2. BACKGROUND JOB
@@ -53,11 +119,23 @@ def run_optimization_job(doctype, docname, request_data_json, user):
         os.makedirs(output_dir, exist_ok=True)
         frappe.log_error(f"Output directory set to: {output_dir}", "Optimizer Debug Trace")
 
+        # Add detailed logging for the input data
+        try:
+            # Use frappe.log_message to have a separate title (max 140 chars) and long content.
+            log_content = (
+                f"Stock Data:\n{json.dumps(request_data.get('stock'), indent=2)}\n\n"
+                f"Parts Data:\n{json.dumps(request_data.get('parts'), indent=2)}"
+            )
+            frappe.log_message(log_content, "Optimizer Input Data")
+        except Exception as e:
+            # Fallback logging with a short title if the main logging fails
+            frappe.log_error(f"Failed to serialize and log input data: {e}", "Optimizer Logging Error")
+
         # Step 1: Run the core 1D Optimizer
         frappe.log_error("Running 1D optimizer...", "Optimizer Debug Trace")
         solution_data, pdf_path, all_patterns_dict = run_1d_optimizer(
-            stock_data=request_data['stock_data'],
-            parts_data=[{'name': name, **data} for name, data in request_data['parts_data'].items()],
+            stock_data=request_data['stock'],
+            parts_data=[{'name': name, **data} for name, data in request_data['parts'].items()],
             saw_kerf=request_data['saw_kerf'],
             project_description=request_data['project_description'],
             output_dir_base=output_dir,
@@ -66,7 +144,10 @@ def run_optimization_job(doctype, docname, request_data_json, user):
         frappe.log_error(f"Optimizer finished. Solution found: {'Yes' if solution_data else 'No'}", "Optimizer Debug Trace")
 
         if not solution_data:
-            raise ValueError("Optimization failed. The problem is likely infeasible.")
+            # If no solution, we should still return something to the job caller.
+            frappe.log_error("Optimization did not find a solution.", "Optimizer Error")
+            # The 'return' here sets the 'output' of the JobLog document.
+            return {"status": "failed", "message": "Optimization failed to find a feasible solution."}
 
         # Step 2: Update the original Sales Order with the solution
         # Note: This step is now optional and disabled by default
@@ -119,6 +200,9 @@ def run_optimization_job(doctype, docname, request_data_json, user):
             user=user
         )
         frappe.log_error("Job completed successfully.", "Optimizer Debug Trace")
+        
+        # This return value will be stored in the JobLog's 'output' field.
+        return solution_data
 
     except Exception as e:
         # Log the full traceback to the error log
@@ -130,6 +214,218 @@ def run_optimization_job(doctype, docname, request_data_json, user):
             message=_("Optimization failed for Sales Order {0}. See Error Log for details.").format(docname),
             user=user
         )
+        
+        # Also return the error message in the job output.
+        return {"status": "error", "message": str(e)}
+
+def run_full_optimization_job(sales_order_name, config, user):
+    """
+    This function runs in the background. It iterates through each profile,
+    runs optimization, and generates a SEPARATE PDF report for each.
+    Finally, it updates the Sales Order quantities.
+    """
+    try:
+        job_id = frappe.local.job.name
+        frappe.publish_realtime("update_job_status", {"job_id": job_id, "status": "running", "progress": 10, "message": "Starting job..."})
+
+        has_errors = False
+        profiles_to_run = config.get("profiles", {})
+        total_profiles = len(profiles_to_run)
+        updated_quantities = {}
+
+        # --- Main Loop: Optimize and Generate PDF for each profile ---
+        for i, item_code in enumerate(profiles_to_run):
+            profile_config = profiles_to_run[item_code]
+            progress = 20 + int((i / total_profiles) * 70)
+            frappe.publish_realtime("update_job_status", {"job_id": job_id, "status": "running", "progress": progress, "message": f"Optimizing {item_code}"})
+
+            stock_data = {item_code: {"length": profile_config["stock_length_mm"]}}
+            parts_data = profile_config["parts"]
+            saw_kerf = profile_config.get("saw_kerf_mm", 1)
+            allow_overproduction = config.get("settings", {}).get("allow_overproduction", False)
+
+            solution = run_1d_optimizer(stock_data, parts_data, saw_kerf, allow_overproduction=allow_overproduction)
+
+            if solution:
+                # Generate and attach the PDF for this specific profile
+                _generate_and_attach_profile_pdf(sales_order_name, item_code, profile_config, solution)
+
+                # Store the required quantity for the final SO update
+                qty_needed = solution.get("total_stock_items_used", {}).get(item_code, 0)
+                updated_quantities[item_code] = qty_needed
+            else:
+                has_errors = True
+                frappe.log_error(f"No feasible solution found for profile {item_code}.", "Optimizer Job Warning")
+
+        if has_errors:
+             frappe.log_error("One or more profiles failed to optimize.", "Optimizer Job Warning")
+
+        # --- Final Step: Update Sales Order item quantities ---
+        frappe.publish_realtime("update_job_status", {"job_id": job_id, "status": "running", "progress": 90, "message": "Updating Sales Order..."})
+        if updated_quantities:
+            _update_sales_order_items(sales_order_name, updated_quantities)
+
+    except Exception as e:
+        frappe.log_error(frappe.get_traceback(), "Full Optimization Job Failed")
+        frappe.publish_realtime("update_job_status", {"job_id": job_id, "status": "failed", "error": str(e)})
+        return
+
+    result = {"message": "Optimization complete."}
+    frappe.publish_realtime("update_job_status", {"job_id": job_id, "status": "complete", "result": result})
+
+
+def _update_sales_order_items(doc_name, quantities_map):
+    """Updates the quantities of specified items in a Sales Order."""
+    so_doc = frappe.get_doc("Sales Order", doc_name)
+    updated = False
+    for item in so_doc.items:
+        if item.item_code in quantities_map:
+            new_qty = quantities_map[item.item_code]
+            if item.qty != new_qty:
+                item.qty = new_qty
+                updated = True
+    
+    if updated:
+        so_doc.save(ignore_permissions=True)
+        frappe.db.commit()
+
+
+def _generate_and_attach_profile_pdf(doc_name, item_code, profile_config, solution):
+    """
+    Generates and attaches a PDF report for a single profile's optimization solution.
+    """
+    prepared_data = _prepare_single_profile_for_pdf(solution, profile_config, item_code)
+
+    pdf_gen = OneDCuttingPDFGenerator(
+        stock_data=prepared_data["stock_data"],
+        parts_data=prepared_data["parts_data"],
+        all_patterns_dict=prepared_data["patterns"],
+        solution_details_list=[prepared_data["solution_details"]],
+        parts_production_summary_list=prepared_data["production_summary"],
+        saw_kerf=profile_config.get("saw_kerf_mm", 1)
+    )
+    
+    pdf_buffer = pdf_gen.generate_pdf()
+    pdf_buffer.seek(0)
+    
+    file_name = f"Optimizer_Report_{item_code}.pdf"
+    _attach_pdf_to_document(pdf_buffer, doc_name, file_name)
+
+
+def _prepare_single_profile_for_pdf(solution, profile_config, item_code):
+    """
+    Takes the solution for a single profile and calculates the rich, 
+    detailed statistics required by the PDF generator.
+    """
+    saw_kerf = profile_config.get("saw_kerf_mm", 1)
+    
+    # Use a deepcopy to prevent modifying the original solution object,
+    # which could cause issues in subsequent loops.
+    patterns_for_pdf = copy.deepcopy(solution.get("patterns", []))
+
+    # The PDF generator needs a 'name' for each part. We'll create one from the length.
+    parts_data_1d = [
+        {'name': f"part_{p['length']}_{item_code[:4]}", 'length': p['length'], 'demand': p['demand']}
+        for p in profile_config.get("parts", [])
+    ]
+    parts_map_len_to_name = {f"{p['length']}": p['name'] for p in parts_data_1d}
+    parts_map_name_to_info = {p['name']: p for p in parts_data_1d}
+
+    # Remap layout_pieces to use the generated part name for PDF rendering
+    for pattern in patterns_for_pdf:
+        for piece in pattern.get("layout_pieces", []):
+            piece["part_id"] = parts_map_len_to_name.get(str(piece["part_id"]), "?")
+
+    stock_data_1d = {
+        item_code: {
+            "length": profile_config.get("stock_length_mm", 6000),
+            "cost": profile_config.get("cost_per_piece", 0),
+            "weight": profile_config.get("weight_per_piece", 0)
+        }
+    }
+    
+    stock_info = stock_data_1d[item_code]
+    stock_weight_per_mm = (stock_info.get('weight', 0) / stock_info['length']) if stock_info.get('length', 0) > 0 else 0
+    
+    total_stock_items_used = solution.get('total_stock_items_used', {}).get(item_code, 0)
+    
+    stats = {
+        'profile_id': item_code,
+        'total_length_all_parts_produced_mm': 0, 'total_length_all_stock_used_mm': 0,
+        'total_kerf_length_mm': 0, 'total_waste_length_mm': 0,
+        'total_number_of_cuts': 0, 'total_weight_all_stock_used_kg': 0,
+        'total_weight_all_parts_produced_kg': 0, 'total_weight_kerf_kg': 0,
+        'weight_produced_per_part_kg': {p['name']: 0 for p in parts_data_1d}
+    }
+
+    used_patterns_from_solution = patterns_for_pdf
+    for pattern in used_patterns_from_solution:
+        usage_count = pattern.get('usage_count', 1)
+        stats['total_length_all_stock_used_mm'] += stock_info['length'] * usage_count
+        stats['total_weight_all_stock_used_kg'] += stock_info.get('weight', 0) * usage_count
+        stats['total_kerf_length_mm'] += pattern.get('total_kerf_length_in_pattern', 0) * usage_count
+        stats['total_waste_length_mm'] += pattern.get('waste_length_in_pattern', 0) * usage_count
+        stats['total_number_of_cuts'] += pattern.get('num_cuts_in_pattern', 0) * usage_count
+        stats['total_length_all_parts_produced_mm'] += pattern.get('total_parts_length_in_pattern', 0) * usage_count
+        
+        stats['total_weight_kerf_kg'] += pattern.get('total_kerf_length_in_pattern', 0) * stock_weight_per_mm * usage_count
+        
+        for part_name, part_info in parts_map_name_to_info.items():
+            yield_count = pattern.get('yield', {}).get(f"{part_info['length']}", 0)
+            if yield_count > 0:
+                part_weight = part_info['length'] * stock_weight_per_mm
+                stats['weight_produced_per_part_kg'][part_name] += part_weight * yield_count * usage_count
+                stats['total_weight_all_parts_produced_kg'] += part_weight * yield_count * usage_count
+
+    stats['total_weight_waste_kg'] = stats['total_weight_all_stock_used_kg'] - stats['total_weight_all_parts_produced_kg'] - stats['total_weight_kerf_kg']
+    
+    solution_details_for_pdf = {
+        'total_stock_items_used': solution.get('total_stock_items_used'),
+        'total_parts_produced': solution.get('total_parts_produced'),
+        'pattern_usage': {p['pattern_id']: p['usage_count'] for p in used_patterns_from_solution},
+        'total_stock_cost': total_stock_items_used * stock_info.get('cost', 0),
+        **stats
+    }
+
+    all_patterns_dict_1d = {p['pattern_id']: p for p in used_patterns_from_solution}
+
+    # --- Create Parts Production Summary for this profile ---
+    parts_production_summary = []
+    total_parts_produced_map = solution.get("total_parts_produced", {})
+    for part_info in parts_data_1d:
+        part_name = part_info['name']
+        demand = part_info['demand']
+        produced = total_parts_produced_map.get(f"{part_info['length']}", 0)
+        delta = produced - demand
+        part_total_weight = stats['weight_produced_per_part_kg'].get(part_name, 0)
+        
+        parts_production_summary.append({
+            'Part ID': part_name,
+            'Length (mm)': part_info['length'],
+            'Demand': demand,
+            'Produced': produced,
+            'Delta (+/-)': delta,
+            'Total Wt (kg)': part_total_weight
+        })
+    
+    return {
+        "solution_details": solution_details_for_pdf,
+        "patterns": all_patterns_dict_1d,
+        "stock_data": stock_data_1d,
+        "parts_data": parts_data_1d,
+        "production_summary": parts_production_summary
+    }
+
+
+def _attach_pdf_to_document(pdf_buffer, doc_name, file_name):
+    """Attaches a PDF from a buffer to a Frappe document."""
+    file_doc = frappe.new_doc("File")
+    file_doc.file_name = file_name
+    file_doc.attached_to_doctype = "Sales Order"
+    file_doc.attached_to_name = doc_name
+    file_doc.content = pdf_buffer.getvalue()
+    file_doc.is_private = 1
+    file_doc.insert(ignore_permissions=True)
 
 # ==============================================================================
 # 3. SALES ORDER UPDATE LOGIC
@@ -172,192 +468,9 @@ def update_so_with_solution(solution_data, all_patterns_dict, original_docname):
     
     return so.name
 
-# ==============================================================================
-# 4. CORE OPTIMIZER LOGIC (Adapted from optimizer_1d.py)
-# ==============================================================================
+# =================================================================================================
+# 4. CORE OPTIMIZER LOGIC (Placeholder - This should be in its own file)
+# =================================================================================================
 
-def run_1d_optimizer(stock_data, parts_data, saw_kerf, project_description, output_dir_base, allow_overproduction=False):
-    """
-    Main function to run the 1D optimization.
-    Returns: solution_details_1d, output_pdf_path, all_patterns_map
-    """
-    print("--- Starting 1D Optimization ---")
-
-    # Generate all possible cutting patterns.
-    all_patterns_1d = generate_all_patterns_1d(stock_data, parts_data, saw_kerf)
-    if not all_patterns_1d:
-        print("No valid cutting patterns could be generated.")
-        return None, None, None
-
-    # Solve the cutting stock problem to find the optimal combination of patterns.
-    solution_details_1d = solve_1d_cutting_problem(all_patterns_1d, stock_data, parts_data, allow_overproduction)
-    if not solution_details_1d:
-        print("Solver failed to find a feasible solution.")
-        return None, None, None
-        
-    all_patterns_map = {p['pattern_id']: p for p in all_patterns_1d}
-    
-    # --- Generate PDF report ---
-    # Create a unique filename for the PDF report.
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    sanitized_project_name = re.sub(r'[\\/*?:"<>|]', "", project_description)[:50]
-    output_filename_base = f"1D-Cut-Plan_{sanitized_project_name}_{timestamp}"
-    output_pdf_path = os.path.join(output_dir_base, f"{output_filename_base}.pdf")
-    
-    # Fix parameter order to match function signature in pdf_generator_1d.py
-    export_solution_to_pdf_1d(
-        output_pdf_path,  # filename
-        solution_details_1d,  # solution_details
-        all_patterns_map,  # all_patterns_dict_1d
-        stock_data,  # stock_data_1d
-        parts_data,  # parts_data_1d
-        saw_kerf,  # saw_kerf_1d
-        project_description  # project_description_1d
-    )
-    
-    print(f"--- 1D Optimization Complete. Report at {output_pdf_path} ---")
-    
-    return solution_details_1d, output_pdf_path, all_patterns_map
-
-# ... (The rest of the functions from optimizer_1d.py would go here)
-# For brevity, I will add them in a subsequent step.
-# The functions to add are:
-# - solve_1d_cutting_problem
-# - generate_all_patterns_1d
-# - _generate_patterns_recursive_1d
-# - _add_pattern_if_new_1d
-
-def _add_pattern_if_new_1d(current_yield_dict, layout_details, generated_patterns, pattern_hashes, stock_id, stock_length, parts_data_map, saw_kerf):
-    if not current_yield_dict:
-        return
-    yield_tuple = tuple(sorted(current_yield_dict.items()))
-    if yield_tuple not in pattern_hashes:
-        pattern_hashes.add(yield_tuple)
-        total_length_of_parts_in_pattern = sum(parts_data_map[part_id]['length'] * count for part_id, count in current_yield_dict.items())
-        num_kerfs_in_pattern = max(0, len(layout_details) - 1)
-        temp_used_length = total_length_of_parts_in_pattern + (num_kerfs_in_pattern * saw_kerf)
-        remaining_offcut = stock_length - temp_used_length
-        if layout_details and remaining_offcut > 0.01:
-            num_kerfs_in_pattern += 1
-        total_kerf_length_in_pattern = num_kerfs_in_pattern * saw_kerf
-        total_used_length_in_pattern = total_length_of_parts_in_pattern + total_kerf_length_in_pattern
-        waste_length_in_pattern = stock_length - total_used_length_in_pattern
-        pattern_id = f"{stock_id}_p1d{len(generated_patterns)}"
-        generated_patterns.append({
-            'pattern_id': pattern_id, 'stock_id_used': stock_id, 'yield': current_yield_dict.copy(),
-            'layout_pieces': list(layout_details), 'total_parts_length_in_pattern': total_length_of_parts_in_pattern,
-            'total_kerf_length_in_pattern': total_kerf_length_in_pattern, 'total_used_length_in_pattern': total_used_length_in_pattern,
-            'waste_length_in_pattern': waste_length_in_pattern, 'num_cuts_in_pattern': num_kerfs_in_pattern
-        })
-
-def _generate_patterns_recursive_1d(stock_length, remaining_length, current_yield, current_layout, parts_to_try, generated_patterns, pattern_hashes, stock_id, parts_data_map, saw_kerf):
-    if current_yield:
-        _add_pattern_if_new_1d(current_yield, current_layout, generated_patterns, pattern_hashes, stock_id, stock_length, parts_data_map, saw_kerf)
-    for i, part in enumerate(parts_to_try):
-        part_id, part_length = part['name'], part['length']
-        length_needed = part_length + (saw_kerf if current_layout else 0)
-        if length_needed <= remaining_length:
-            new_yield = current_yield.copy()
-            new_yield[part_id] = new_yield.get(part_id, 0) + 1
-            new_layout = current_layout.copy()
-            new_layout.append({'part_id': part_id, 'length': part_length})
-            _generate_patterns_recursive_1d(stock_length, remaining_length - length_needed, new_yield, new_layout, parts_to_try[i:], generated_patterns, pattern_hashes, stock_id, parts_data_map, saw_kerf)
-
-def generate_all_patterns_1d(stock_data, parts_data, saw_kerf):
-    all_patterns, parts_data_map = [], {part['name']: part for part in parts_data}
-    sorted_parts = sorted(parts_data, key=lambda p: p['length'], reverse=True)
-    for stock_id, stock_info in stock_data.items():
-        stock_length = stock_info['length']
-        generated_patterns_for_stock, pattern_hashes = [], set()
-        _generate_patterns_recursive_1d(stock_length, stock_length, {}, [], sorted_parts, generated_patterns_for_stock, pattern_hashes, stock_id, parts_data_map, saw_kerf)
-        all_patterns.extend(generated_patterns_for_stock)
-    return all_patterns
-
-def solve_1d_cutting_problem(all_patterns_1d, stock_data, parts_data, allow_overproduction=False):
-    model = cp_model.CpModel()
-    parts_data_map = {part['name']: part for part in parts_data}
-    max_usage_heuristic = sum(p_info['demand'] for p_info in parts_data_map.values())
-    num_times_pattern_used = [model.NewIntVar(0, min(max_usage_heuristic, stock_data[p['stock_id_used']].get('available', max_usage_heuristic)), f"p1d_{p['pattern_id']}") for p in all_patterns_1d]
-    
-    overproduction_vars = {}
-    avg_cost_per_mm = sum(s['cost'] / s['length'] for s in stock_data.values() if s['length'] > 0) / len(stock_data) if stock_data and allow_overproduction else 0
-    for part_info in parts_data:
-        part_id = part_info['name']
-        constraint_expr = sum(num_times_pattern_used[i] * p['yield'].get(part_id, 0) for i, p in enumerate(all_patterns_1d))
-        if allow_overproduction:
-            overproduction_vars[part_id] = model.NewIntVar(0, max_usage_heuristic * 10, f'over_{part_id}')
-            model.Add(constraint_expr == part_info['demand'] + overproduction_vars[part_id])
-        else:
-            model.Add(constraint_expr == part_info['demand'])
-            
-    for stock_id, stock_info in stock_data.items():
-        if 'available' in stock_info:
-            model.Add(sum(num_times_pattern_used[i] for i, p in enumerate(all_patterns_1d) if p['stock_id_used'] == stock_id) <= stock_info['available'])
-            
-    total_cost_expr = sum(num_times_pattern_used[i] * stock_data[all_patterns_1d[i]['stock_id_used']]['cost'] for i in range(len(all_patterns_1d)))
-    if allow_overproduction and avg_cost_per_mm > 0:
-        overproduction_penalty = sum(overproduction_vars[p['name']] * p['length'] * avg_cost_per_mm for p in parts_data)
-        waste_penalty = sum(num_times_pattern_used[i] * all_patterns_1d[i]['waste_length_in_pattern'] * avg_cost_per_mm for i in range(len(all_patterns_1d)))
-        model.Minimize(total_cost_expr + overproduction_penalty + waste_penalty)
-    else:
-        model.Minimize(total_cost_expr)
-        
-    solver = cp_model.CpSolver()
-    solver.parameters.log_search_progress = True
-    solver.parameters.max_time_in_seconds = 60.0
-    status = solver.Solve(model)
-
-    if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        solution = {'total_objective_value': solver.ObjectiveValue()}
-        pattern_usage, stock_used, parts_prod = {}, {}, {}
-        # ... logic to populate solution details ...
-        true_stock_cost = sum(solver.Value(num_times_pattern_used[i]) * stock_data[all_patterns_1d[i]['stock_id_used']]['cost'] for i in range(len(all_patterns_1d)))
-        solution_details_1d = {'total_objective_value': true_stock_cost}
-        pattern_usage, total_stock_items_used_map, total_parts_produced_map = {}, {sid: 0 for sid in stock_data}, {pid['name']: 0 for pid in parts_data}
-        # ... and so on for all the metrics ...
-        
-        # This part is complex, will just copy-paste and adapt
-        total_length_all_parts_produced_mm, total_length_all_stock_used_mm, total_kerf_length_solution, total_waste_length_solution, total_number_of_cuts_solution, total_weight_all_stock_used_kg, total_weight_all_parts_produced_kg, total_weight_all_kerf_material_kg = 0,0,0,0,0,0,0,0
-        total_weight_produced_per_part_map_kg = {part['name']: 0 for part in parts_data}
-
-        for i, pattern in enumerate(all_patterns_1d):
-            usage_count = solver.Value(num_times_pattern_used[i])
-            if usage_count > 0:
-                pattern_usage[pattern['pattern_id']] = usage_count
-                stock_id = pattern['stock_id_used']
-                stock_info = stock_data[stock_id]
-                total_stock_items_used_map[stock_id] += usage_count
-                total_length_all_stock_used_mm += stock_info['length'] * usage_count
-                total_weight_all_stock_used_kg += stock_info.get('weight', 0) * usage_count
-                kerf_len = pattern.get('total_kerf_length_in_pattern', 0)
-                total_kerf_length_solution += kerf_len * usage_count
-                stock_weight_per_mm = (stock_info['weight'] / stock_info['length']) if stock_info.get('length', 0) > 0 and stock_info.get('weight', 0) > 0 else 0
-                total_weight_all_kerf_material_kg += kerf_len * stock_weight_per_mm * usage_count
-                total_length_all_parts_produced_mm += pattern.get('total_parts_length_in_pattern', 0) * usage_count
-                total_waste_length_solution += pattern.get('waste_length_in_pattern', 0) * usage_count
-                total_number_of_cuts_solution += pattern.get('num_cuts_in_pattern', 0) * usage_count
-                for part_id, yielded_count in pattern['yield'].items():
-                    total_parts_produced_map[part_id] += yielded_count * usage_count
-                    part_len = parts_data_map[part_id]['length']
-                    part_weight = part_len * stock_weight_per_mm
-                    total_weight_produced_per_part_map_kg[part_id] += part_weight * yielded_count * usage_count
-                    total_weight_all_parts_produced_kg += part_weight * yielded_count * usage_count
-
-        solution_details_1d.update({
-            'pattern_usage': pattern_usage,
-            'total_stock_items_used': total_stock_items_used_map,
-            'total_parts_produced': total_parts_produced_map,
-            'total_stock_cost': true_stock_cost,
-            'total_length_all_stock_used_mm': total_length_all_stock_used_mm,
-            'total_weight_all_stock_used_kg': total_weight_all_stock_used_kg,
-            'total_length_all_parts_produced_mm': total_length_all_parts_produced_mm,
-            'total_weight_all_parts_produced_kg': total_weight_all_parts_produced_kg,
-            'total_kerf_length_mm': total_kerf_length_solution,
-            'total_waste_length_mm': total_waste_length_solution,
-            'total_weight_kerf_kg': total_weight_all_kerf_material_kg,
-            'total_weight_waste_kg': total_weight_all_stock_used_kg - total_weight_all_parts_produced_kg - total_weight_all_kerf_material_kg,
-            'total_number_of_cuts': total_number_of_cuts_solution,
-            'weight_produced_per_part_kg': total_weight_produced_per_part_map_kg
-        })
-        return solution_details_1d
-    return None 
+# The core optimizer functions (run_1d_optimizer, solve_1d_cutting_problem, etc.)
+# have been moved to a separate file: optimizer_core.py for better organization. 

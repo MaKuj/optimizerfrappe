@@ -1,0 +1,18 @@
+[
+    {
+        "doctype": "Custom Field",
+        "dt": "Sales Order",
+        "fieldname": "custom_optimizer",
+        "fieldtype": "Tab Break",
+        "insert_after": "connections_tab",
+        "label": "Optimizer"
+    },
+    {
+        "doctype": "Custom Field",
+        "dt": "Sales Order",
+        "fieldname": "custom_optimizer_output",
+        "fieldtype": "Text",
+        "insert_after": "custom_optimizer",
+        "label": "Optimizer Output"
+    }
+]
