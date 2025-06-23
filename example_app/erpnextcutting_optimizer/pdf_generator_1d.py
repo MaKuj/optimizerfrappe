@@ -102,8 +102,8 @@ class OneDCuttingPDFGenerator:
         self.c.drawString(self.margins['left'], y_pos, "Stock Items Consumption")
         y_pos -= self.line_height * 1.5
         
-        headers = ["Stock ID", "Length", "Cost", "Used Qty", "Total Cost", "Total Wt"]
-        coords = [self.margins['left'] + x for x in [0, 130, 180, 240, 300, 360]]
+        headers = ["Stock ID", "Length (mm)", "Cost/Item", "Used Qty", "Total Cost", "Total Wt (kg)"]
+        coords = [self.margins['left'] + x for x in [5*mm, 50*mm, 85*mm, 115*mm, 140*mm, 165*mm]]
         
         self._set_font('sub_header')
         for i, h in enumerate(headers):
@@ -117,8 +117,8 @@ class OneDCuttingPDFGenerator:
             total_cost = count * info.get('cost', 0)
             total_weight = count * info.get('weight', 0)
             values = [
-                stock_id, f"{info.get('length', 0)} mm", f"{info.get('cost', 0):.2f}",
-                count, f"{total_cost:.2f}", f"{total_weight:.2f} kg"
+                stock_id, f"{info.get('length', 0)}", f"{info.get('cost', 0):.2f}",
+                count, f"{total_cost:.2f}", f"{total_weight:.2f}"
             ]
             for i, v in enumerate(values):
                 self.c.drawString(coords[i], y_pos, str(v))
@@ -130,8 +130,8 @@ class OneDCuttingPDFGenerator:
         self.c.drawString(self.margins['left'], y_pos, "Parts Production Summary")
         y_pos -= self.line_height * 1.5
 
-        headers = ["Part ID", "Length", "Demand", "Produced", "Delta", "Total Wt"]
-        coords = [self.margins['left'] + x for x in [0, 130, 180, 240, 300, 360]]
+        headers = ["Part ID", "Length (mm)", "Demand", "Produced", "Delta (+/-)", "Total Wt (kg)"]
+        coords = [self.margins['left'] + x for x in [5*mm, 40*mm, 70*mm, 100*mm, 130*mm, 160*mm]]
         self._set_font('sub_header')
         for i, h in enumerate(headers):
             self.c.drawString(coords[i], y_pos, h)
@@ -139,9 +139,14 @@ class OneDCuttingPDFGenerator:
 
         self._set_font('body_small')
         for item in summary_data:
+            delta = item.get('Delta (+/-)', 0)
             values = [
-                item['Part ID'], f"{item['Length (mm)']} mm", item['Demand'],
-                item['Produced'], f"{item['Delta (+/-)']:+.0f}", f"{item['Total Wt (kg)']:.2f} kg"
+                item.get('Part ID', 'N/A'),
+                f"{item.get('Length (mm)', 0)}",
+                item.get('Demand', 0),
+                item.get('Produced', 0),
+                f"{delta:+.0f}",
+                f"{item.get('Total Wt (kg)', 0):.2f}"
             ]
             for i, v in enumerate(values):
                 self.c.drawString(coords[i], y_pos, str(v))
@@ -149,34 +154,55 @@ class OneDCuttingPDFGenerator:
         return y_pos
         
     def _draw_part_legend(self, y_pos):
-        # This part remains mostly the same, just using class variables
         part_colors = [
             colors.HexColor("#ADD8E6"), colors.HexColor("#90EE90"), colors.HexColor("#FFB6C1"),
             colors.HexColor("#E6E6FA"), colors.HexColor("#FFDEAD"), colors.HexColor("#AFEEEE"),
             colors.HexColor("#F0E68C"), colors.HexColor("#DDA0DD"), colors.HexColor("#ff9999"),
         ]
+        
+        known_parts_by_name = {p['name']: p for p in self.parts_data if 'name' in p}
+        length_to_name_map = {p['length']: p['name'] for p in self.parts_data if 'name' in p and 'length' in p}
+
+        all_part_ids_in_solution = set(known_parts_by_name.keys())
+
+        for pattern_details in self.all_patterns_dict.values():
+            for piece in pattern_details.get('layout_pieces', []):
+                part_id = piece.get('part_id')
+                if not part_id or part_id not in known_parts_by_name:
+                    part_length = piece.get('length')
+                    if part_length in length_to_name_map:
+                        piece['part_id'] = length_to_name_map[part_length]
+                        all_part_ids_in_solution.add(piece['part_id'])
+                elif part_id:
+                     all_part_ids_in_solution.add(part_id)
+
+        sorted_part_ids = sorted(list(all_part_ids_in_solution))
+
         part_meta_data = {
-            part['name']: {
-                'short_id': f"P{i+1}", 'color': part_colors[i % len(part_colors)],
-                'length': part['length']
-            } for i, part in enumerate(self.parts_data)
+            part_id: {
+                'short_id': f"P{i+1}",
+                'color': part_colors[i % len(part_colors)],
+                'length': known_parts_by_name[part_id].get('length', 0)
+            } for i, part_id in enumerate(sorted_part_ids) if part_id in known_parts_by_name
         }
-        self.part_meta_data = part_meta_data # Save for use in pattern drawing
+        self.part_meta_data = part_meta_data
         
         self._set_font('header')
         self.c.drawString(self.margins['left'], y_pos, "Part Legend")
         y_pos -= self.line_height
 
         self._set_font('body_small')
-        for part_id, meta in part_meta_data.items():
+        for part_id, meta in self.part_meta_data.items():
             self.c.setFillColor(meta['color'])
             self.c.rect(self.margins['left'] + 2*mm, y_pos - 1*mm, 4*mm, 4*mm, stroke=1, fill=1)
             self.c.setFillColor(colors.black)
-            self.c.drawString(self.margins['left'] + 8*mm, y_pos, f"{meta['short_id']}: {part_id} ({meta['length']:.1f}mm)")
+            legend_text = f"{meta['short_id']}: {part_id} ({meta['length']:.1f}mm)"
+            self.c.drawString(self.margins['left'] + 8*mm, y_pos, legend_text)
             y_pos -= self.line_height * 0.9
             if y_pos < self.margins['bottom']:
                 self.c.showPage()
                 y_pos = self.height - self.margins['top']
+                self._set_font('body_small') # Reset font on new page
         return y_pos
 
     def _draw_all_patterns(self):
@@ -198,12 +224,21 @@ class OneDCuttingPDFGenerator:
             y_pos_pattern -= (height - 40*mm) / max_patterns_per_page
             
     def _draw_single_pattern(self, y_pos, pattern_id, pattern_details, page_width):
-        stock_id = pattern_details['stock_id_used']
+        stock_id = pattern_details.get('stock_id_used')
+        if not stock_id:
+            return
+
         stock_info = self.stock_data.get(stock_id, {})
         stock_length = stock_info.get('length', 0)
         
         self._set_font('sub_header')
-        usage = self.solution_details_list[0]['pattern_usage'].get(pattern_id, 1) # Simplified for now
+        
+        usage = 0
+        for details in self.solution_details_list:
+            if pattern_id in details.get('pattern_usage', {}):
+                usage = details['pattern_usage'][pattern_id]
+                break
+        
         title = f"Pattern: {pattern_id} (used {usage} times on stock '{stock_id}')"
         self.c.drawString(self.margins['left'], y_pos, title)
         
