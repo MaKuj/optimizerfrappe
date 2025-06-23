@@ -87,6 +87,12 @@ async function sync_config_with_so_items(frm, config) {
         if (!config.profiles[item_code]) {
             try {
                 const item_doc = await frappe.db.get_doc('Item', item_code);
+
+                // Exclude items from the 'Services' group from being added as profiles
+                if (item_doc.item_group === 'Services') {
+                    continue;
+                }
+                
                 let length_in_meters = 0;
                 
                 if (item_doc.uoms && item_doc.uoms.length) {
@@ -112,9 +118,26 @@ async function sync_config_with_so_items(frm, config) {
         }
     }
 
-    for (const item_code in config.profiles) {
+    // --- Cleanup Logic ---
+    // Iterate over a copy of the keys, as we might modify the object.
+    const profiles_to_check = Object.keys(config.profiles);
+    for (const item_code of profiles_to_check) {
+        // Condition 1: Item was removed from the sales order grid.
         if (!so_item_codes.has(item_code)) {
             delete config.profiles[item_code];
+            continue; // Go to next item
+        }
+
+        // Condition 2: Item is a service item and should be removed.
+        try {
+            const item_doc = await frappe.db.get_doc('Item', item_code);
+            if (item_doc.item_group === 'Services') {
+                delete config.profiles[item_code];
+            }
+        } catch (e) {
+            // If the item doesn't exist, it should be removed anyway.
+            delete config.profiles[item_code];
+            console.error("Could not verify item group for", item_code, e);
         }
     }
 }
@@ -217,7 +240,7 @@ function render_profiles_html(dialog, frm, config) {
                 </tr>
             </thead>
             <tbody>
-                ${Object.keys(config.profiles).filter(item_code => item_code !== 'OP-CUT').map(item_code => {
+                ${Object.keys(config.profiles).map(item_code => {
                     const profile = config.profiles[item_code];
                     const total_parts = profile.parts.reduce((sum, part) => sum + part.demand, 0);
                     const summary = total_parts > 0 
