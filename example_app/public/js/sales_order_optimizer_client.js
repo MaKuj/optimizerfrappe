@@ -1,295 +1,356 @@
 // sales_order_optimizer_client.js
 // This script adds a button to the Sales Order doctype to run the 1D optimizer.
 console.log("Optimizer script for Sales Order loaded!");
-// frappe.msgprint("Optimizer Script Loaded!"); // This is a temporary debug message. Removing it now.
 
+// =================================================================================================
+// 1. ATTACH BUTTON TO SALES ORDER FORM
+// =================================================================================================
 frappe.ui.form.on('Sales Order', {
 	refresh: function(frm) {
 		console.log("Inside Sales Order refresh event.");
-		console.log("Current document status (frm.doc.docstatus):", frm.doc.docstatus);
 		
-		// Only show the button on Draft (0) and Submitted (1) documents.
-		if (frm.doc.docstatus > 1) { // 2 is Cancelled
-			console.log("Condition met: docstatus is Cancelled. Button will not be shown.");
+		// Button should be available on new or draft documents.
+		if (frm.doc.docstatus > 0 && !frm.is_dirty()) { 
+			console.log("Condition met: docstatus is not 0. Button will not be shown.");
             return;
         }
 		
-		console.log("Condition passed: docstatus is 0 or 1. Attempting to add button now.");
+		console.log("Attempting to add optimizer button.");
         frm.add_custom_button(__('1D Cut Optimizer'), function() {
-			// When button is clicked, open the dialog
-            show_optimizer_dialog(frm);
+            // If the document is new or has been modified, it needs a customer to be valid.
+            // The logic now populates the SO, so we don't need to save first.
+            show_master_optimizer_dialog(frm);
         }, __("Create"));
 		console.log("Button should have been added to the 'Create' menu.");
 	}
 });
 
-function show_optimizer_dialog(frm) {
-    let stock_items = [];
-    let part_items = [];
 
-    // Heuristic to separate stock from parts from the Sales Order items table
-    frm.doc.items.forEach(item => {
-        // A simple heuristic: items with 'bar' or 'stock' in their name are stock.
-        // You might need a more robust way to distinguish them, like a custom field.
-        if (item.item_code.toLowerCase().includes('bar') || item.item_code.toLowerCase().includes('stock')) {
-            stock_items.push({
-                name: item.item_code,
-                length: item.custom_length || 0, // Assuming a custom field 'custom_length'
-                available: 9999, // Assuming infinite for now
-                cost: item.rate || 0,
-                weight: item.weight_per_unit || 0 // Added weight field
-            });
-        } else {
-            part_items.push({
-                name: item.item_code,
-                length: item.custom_length || 0, // Assuming a custom field 'custom_length'
-                demand: item.qty || 0,
-                weight: item.weight_per_unit || 0 // Added weight field
-            });
+// =================================================================================================
+// 2. STATE MANAGEMENT & CONFIGURATION
+// =================================================================================================
+
+/**
+ * Creates a fresh, empty configuration object.
+ */
+function get_initial_config() {
+    return {
+        version: "2.0",
+        profiles: {}, // Keyed by item_code. Stores parts lists and settings for each profile.
+        settings: {
+            saw_kerf: 3.0, // Global setting for saw kerf.
+            allow_overproduction: 0
+        },
+        results: {} // To store the output from the optimizer.
+    };
+}
+
+/**
+ * Reads the configuration from the form's custom field.
+ * If the field is empty or invalid, it returns a fresh config object.
+ * @param {object} frm - The Sales Order form object.
+ * @returns {object} The optimizer configuration object.
+ */
+function load_config_from_form(frm) {
+    let config;
+    try {
+        config = JSON.parse(frm.doc.custom_optimizer_output);
+        if (!config || config.version !== "2.0" || !config.profiles) {
+            throw "Invalid config format or version.";
         }
-    });
+    } catch (e) {
+        config = get_initial_config();
+    }
+    return config;
+}
 
+/**
+ * Saves the configuration object back to the form's custom field as a JSON string.
+ * @param {object} frm - The Sales Order form object.
+ * @param {object} config - The optimizer configuration object.
+ */
+function save_config_to_form(frm, config) {
+    frm.set_value('custom_optimizer_output', JSON.stringify(config, null, 2));
+}
+
+/**
+ * Synchronizes the configuration with the items currently in the Sales Order grid.
+ * - Adds new profiles for items that are in the SO but not in the config.
+ * - Removes profiles from the config if they are no longer in the SO.
+ * @param {object} frm - The Sales Order form object.
+ * @param {object} config - The optimizer configuration object.
+ */
+async function sync_config_with_so_items(frm, config) {
+    const so_item_codes = new Set(frm.doc.items.map(item => item.item_code).filter(Boolean));
+
+    for (const item_code of so_item_codes) {
+        if (!config.profiles[item_code]) {
+            try {
+                const item_doc = await frappe.db.get_doc('Item', item_code);
+                let length_in_meters = 0;
+                
+                if (item_doc.uoms && item_doc.uoms.length) {
+                    const ks_uom_entry = item_doc.uoms.find(uom => uom.uom === 'ks');
+                    if (ks_uom_entry) {
+                        length_in_meters = ks_uom_entry.conversion_factor;
+                    }
+                }
+
+                config.profiles[item_code] = {
+                    item_code: item_code,
+                    stock_length_mm: length_in_meters > 0 ? length_in_meters * 1000 : 6000,
+                    cost_per_meter: item_doc.valuation_rate || 0,
+                    weight_per_meter: item_doc.weight_per_unit || 0,
+                    cost_per_piece: (item_doc.valuation_rate || 0) * (length_in_meters || 1),
+                    weight_per_piece: (item_doc.weight_per_unit || 0) * (length_in_meters || 1),
+                    parts: [],
+                    solution: {}
+                };
+            } catch (e) {
+                console.error("Failed to fetch item details for", item_code, e);
+            }
+        }
+    }
+
+    for (const item_code in config.profiles) {
+        if (!so_item_codes.has(item_code)) {
+            delete config.profiles[item_code];
+        }
+    }
+}
+
+
+// =================================================================================================
+// 3. MASTER DIALOG (Profile List)
+// =================================================================================================
+
+/**
+ * The main entry point. Shows the master dialog listing all unique profiles from the SO.
+ * @param {object} frm - The Sales Order form object.
+ */
+async function show_master_optimizer_dialog(frm) {
+    const config = load_config_from_form(frm);
+    await sync_config_with_so_items(frm, config);
 
     const dialog = new frappe.ui.Dialog({
-        title: __('1D Cutting Optimizer'),
+        title: __('Optimizer Configuration'),
         fields: [
-            {
-                fieldname: 'settings_section',
-                fieldtype: 'Section Break',
-                label: __('Optimization Settings')
-            },
-            {
-                label: 'Project Name / Description',
-                fieldname: 'project_description',
-                fieldtype: 'Data',
-                default: frm.doc.title || frm.doc.name,
-                reqd: 1
-            },
             {
                 label: 'Saw Kerf (mm)',
                 fieldname: 'saw_kerf',
                 fieldtype: 'Float',
-                default: 3,
+                default: config.settings.saw_kerf,
                 reqd: 1,
-                description: 'The thickness of the saw blade.'
+                onchange: () => config.settings.saw_kerf = dialog.get_value('saw_kerf')
             },
             {
                 label: 'Allow Overproduction',
                 fieldname: 'allow_overproduction',
                 fieldtype: 'Check',
-                default: 0,
-                description: 'Allow producing more parts than demanded if it reduces total stock usage.'
+                default: config.settings.allow_overproduction || 0,
+                description: 'If checked, the optimizer can produce more parts than demanded to minimize waste.',
+                onchange: () => config.settings.allow_overproduction = dialog.get_value('allow_overproduction')
             },
             {
-                fieldname: 'parts_section',
                 fieldtype: 'Section Break',
-                label: __('Parts to Cut (pre-filled from SO)')
+                label: __('Profiles to Optimize')
             },
             {
-                fieldname: 'parts_html',
-                fieldtype: 'HTML'
-            },
-            {
-                fieldname: 'stock_section',
-                fieldtype: 'Section Break',
-                label: __('Stock Material')
-            },
-            {
-                fieldname: 'stock_html',
+                fieldname: 'profiles_html',
                 fieldtype: 'HTML'
             }
         ],
-        primary_action_label: __('Run Optimization'),
-        primary_action(values) {
-            run_optimization(frm, values);
+        primary_action_label: __('Run Optimization & Update SO'),
+        primary_action: () => {
+            save_config_to_form(frm, config);
+            run_full_optimization(frm, config);
             dialog.hide();
         },
-        // Set a wider size for better visibility
+        secondary_action_label: __('Save Configuration Only'),
+        secondary_action: () => {
+            save_config_to_form(frm, config);
+            dialog.hide();
+            frappe.show_alert({ message: 'Configuration saved.', indicator: 'green' });
+        },
         size: 'large'
     });
 
-    const parts_html = `
-        <div class="table-responsive">
-            <table class="table table-bordered table-striped" id="parts_table">
-                <thead>
-                    <tr>
-                        <th>Part Code</th>
-                        <th>Length (mm)</th>
-                        <th>Required Qty</th>
-                        <th>Weight (kg/m)</th>
-                        <th></th>
-                    </tr>
-                </thead>
-                <tbody></tbody>
-            </table>
-        </div>
-        <div class="mt-3">
-            <button id="btn-add-part" class="btn btn-sm btn-default">
-                <i class="fa fa-plus"></i> Add Part
-            </button>
-        </div>
-    `;
-    dialog.get_field('parts_html').$wrapper.html(parts_html);
-
-    const stock_html = `
-        <div class="table-responsive">
-            <table class="table table-bordered table-striped" id="stock_table">
-                <thead>
-                    <tr>
-                        <th>Stock Code</th>
-                        <th>Length (mm)</th>
-                        <th>Available Qty</th>
-                        <th>Cost</th>
-                        <th>Weight (kg/m)</th>
-                        <th></th>
-                    </tr>
-                </thead>
-                <tbody></tbody>
-            </table>
-        </div>
-        <div class="mt-3">
-            <button id="btn-add-stock" class="btn btn-sm btn-default">
-                <i class="fa fa-plus"></i> Add Stock
-            </button>
-        </div>
-    `;
-    dialog.get_field('stock_html').$wrapper.html(stock_html);
-
-    // Bind events correctly using jQuery
-    dialog.$wrapper.find('#btn-add-part').on('click', () => {
-        add_part_row(dialog, {});
-    });
-    dialog.$wrapper.find('#btn-add-stock').on('click', () => {
-        add_stock_row(dialog, {});
-    });
-
-    // Pre-fill dialog tables
-    part_items.forEach(item => add_part_row(dialog, item));
-    stock_items.forEach(item => add_stock_row(dialog, item));
-
-    // Add responsive CSS
-    dialog.$wrapper.find('head').append(`
-        <style>
-            @media (max-width: 767px) {
-                .modal-dialog {
-                    width: 95% !important;
-                    margin: 10px auto !important;
-                }
-                .table-responsive {
-                    border: none;
-                    margin-bottom: 0;
-                }
-                #parts_table input, #stock_table input {
-                    min-width: 60px;
-                }
-                .form-control {
-                    font-size: 14px;
-                    height: 32px;
-                    padding: 5px;
-                }
-            }
-        </style>
-    `);
-
+    render_profiles_html(dialog, frm, config);
     dialog.show();
 }
 
-function add_stock_row(dialog, defaults = {}) {
-    const row = $(`
-        <tr>
-            <td><input type="text" class="form-control" data-key="name" value="${defaults.name || ''}"></td>
-            <td><input type="number" class="form-control" data-key="length" value="${defaults.length || ''}"></td>
-            <td><input type="number" class="form-control" data-key="available" value="${defaults.available || '9999'}"></td>
-            <td><input type="number" step="0.01" class="form-control" data-key="cost" value="${defaults.cost || '0'}"></td>
-            <td><input type="number" step="0.001" class="form-control" data-key="weight" value="${defaults.weight || '0'}"></td>
-            <td><button class="btn btn-danger btn-xs" onclick="$(this).closest('tr').remove()"><i class="fa fa-trash"></i></button></td>
-        </tr>
-    `).appendTo(dialog.get_field('stock_html').$wrapper.find('tbody'));
+/**
+ * Renders the list of profiles inside the master dialog.
+ * @param {object} dialog - The master dialog instance.
+ * @param {object} frm - The Sales Order form object.
+ * @param {object} config - The optimizer configuration object.
+ */
+function render_profiles_html(dialog, frm, config) {
+    const wrapper = dialog.get_field('profiles_html').$wrapper;
+    wrapper.empty();
+
+    const table_html = `
+        <table class="table table-bordered">
+            <thead>
+                <tr>
+                    <th>Profile Item Code</th>
+                    <th>Summary</th>
+                    <th style="width: 120px;">Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+                ${Object.keys(config.profiles).map(item_code => {
+                    const profile = config.profiles[item_code];
+                    const total_parts = profile.parts.reduce((sum, part) => sum + part.demand, 0);
+                    const summary = total_parts > 0 
+                        ? `${profile.parts.length} part types, ${total_parts} total pieces.`
+                        : `<span class="text-muted">No parts defined.</span>`;
+
+                    return `
+                        <tr>
+                            <td><strong>${profile.item_code}</strong></td>
+                            <td>${summary}</td>
+                            <td>
+                                <button class="btn btn-xs btn-default btn-define-cuts" data-item-code="${item_code}">
+                                    <i class="fa fa-list"></i> Define Cuts
+                                </button>
+                            </td>
+                        </tr>
+                    `;
+                }).join('')}
+            </tbody>
+        </table>
+    `;
+    wrapper.html(table_html);
+
+    // Attach event listeners for the "Define Cuts" buttons.
+    wrapper.find('.btn-define-cuts').on('click', function() {
+        const item_code = $(this).data('item-code');
+        show_parts_entry_dialog(config.profiles[item_code], () => {
+            render_profiles_html(dialog, frm, config); // Re-render to update summary.
+        });
+    });
 }
 
-function add_part_row(dialog, defaults = {}) {
-    const row = $(`
-        <tr>
-            <td><input type="text" class="form-control" data-key="name" value="${defaults.name || ''}"></td>
-            <td><input type="number" class="form-control" data-key="length" value="${defaults.length || ''}"></td>
-            <td><input type="number" class="form-control" data-key="demand" value="${defaults.demand || ''}"></td>
-            <td><input type="number" step="0.001" class="form-control" data-key="weight" value="${defaults.weight || '0'}"></td>
-            <td><button class="btn btn-danger btn-xs" onclick="$(this).closest('tr').remove()"><i class="fa fa-trash"></i></button></td>
-        </tr>
-    `).appendTo(dialog.get_field('parts_html').$wrapper.find('tbody'));
+
+// =================================================================================================
+// 4. DETAIL DIALOG (Parts Entry)
+// =================================================================================================
+
+/**
+ * Shows the detail dialog for defining the parts to be cut from a single profile.
+ * @param {object} profile_config - The specific profile object from the main config.
+ * @param {function} on_save_callback - A function to call after parts are confirmed, to refresh the master view.
+ */
+function show_parts_entry_dialog(profile_config, on_save_callback) {
+    const parts_dialog = new frappe.ui.Dialog({
+        title: `Define Cuts for: ${profile_config.item_code}`,
+        fields: [
+            {
+                label: 'Stock Length (mm)',
+                fieldname: 'stock_length_mm',
+                fieldtype: 'Float',
+                default: profile_config.stock_length_mm || 6000,
+                reqd: 1,
+                description: "The length of a single raw material bar for this profile."
+            },
+            {
+                fieldname: 'parts_table',
+                fieldtype: 'Table',
+                label: 'Parts to Cut',
+                fields: [
+                    { label: 'Length (mm)', fieldname: 'length', fieldtype: 'Float', in_list_view: 1, reqd: 1 },
+                    { label: 'Required Qty', fieldname: 'demand', fieldtype: 'Int', in_list_view: 1, reqd: 1 }
+                ],
+                data: profile_config.parts || []
+            }
+        ],
+        primary_action_label: __('Confirm Parts'),
+        primary_action: (values) => {
+            profile_config.stock_length_mm = values.stock_length_mm;
+            profile_config.parts = values.parts_table || []; // Ensure it's an array
+            parts_dialog.hide();
+            on_save_callback();
+        }
+    });
+    parts_dialog.show();
 }
 
-function run_optimization(frm, dialog_values) {
-    frappe.show_alert({ message: 'Collecting data from dialog...', indicator: 'blue' });
 
-    const $dialog_wrapper = $(".modal.show").last();
+// =================================================================================================
+// 5. BACKEND COMMUNICATION
+// =================================================================================================
 
-    const stock_data = {};
-    $dialog_wrapper.find('#stock_table tbody tr').each(function() {
-        const row = $(this);
-        const name = row.find('input[data-key="name"]').val();
-        if (name) {
-            stock_data[name] = {
-                length: parseFloat(row.find('input[data-key="length"]').val() || 0),
-                cost: parseFloat(row.find('input[data-key="cost"]').val() || 0),
-                available: parseInt(row.find('input[data-key="available"]').val() || 0),
-                weight: parseFloat(row.find('input[data-key="weight"]').val() || 0),
-            };
-        }
-    });
-
-    const parts_data = {};
-    $dialog_wrapper.find('#parts_table tbody tr').each(function() {
-        const row = $(this);
-        const name = row.find('input[data-key="name"]').val();
-        if (name) {
-            parts_data[name] = {
-                length: parseFloat(row.find('input[data-key="length"]').val() || 0),
-                demand: parseInt(row.find('input[data-key="demand"]').val() || 0),
-                weight: parseFloat(row.find('input[data-key="weight"]').val() || 0),
-            };
-        }
-    });
-    
-    if (Object.keys(stock_data).length === 0 || Object.keys(parts_data).length === 0) {
-        frappe.throw(__("Please enter at least one stock item and one part to cut."));
-    }
-    
-    // This is the complete data payload needed by the background job.
-    const request_data = {
-        stock_data: stock_data,
-        parts_data: parts_data,
-        saw_kerf: dialog_values.saw_kerf,
-        project_description: dialog_values.project_description,
-        // We no longer need attach_to_doctype/docname here, as it's passed separately
-        allow_overproduction: dialog_values.allow_overproduction == 1,
-    };
-
-    // Show a loading indicator
-    frappe.show_alert({
-        message: __('Starting optimization job. This may take a few minutes...'),
-        indicator: 'blue'
-    });
-
-    // Call the whitelisted method to start the background job
+/**
+ * Sends the entire configuration to the backend to run the full optimization process.
+ * Handles the async job polling and result display.
+ * @param {object} frm - The Sales Order form object.
+ * @param {object} config - The optimizer configuration object.
+ */
+function run_full_optimization(frm, config) {
     frappe.call({
-        method: "example_app.erpnextcutting_optimizer.api.enqueue_optimization_job",
+        method: 'example_app.erpnextcutting_optimizer.api.enqueue_full_optimization',
         args: {
-            doctype: frm.doc.doctype,
-            docname: frm.doc.name,
-            request_data_json: JSON.stringify(request_data)
+            sales_order_name: frm.doc.name,
+            config: config
         },
         callback: function(r) {
-            // The success message is now handled on the server, which will
-            // send a realtime notification. No need to do anything here.
-            if (r.exc) {
-                // If the enqueue call itself fails, show an error.
+            if (r.message && r.message.job_id) {
+                const job_id = r.message.job_id;
+                frappe.show_alert(`Optimization job <strong>${job_id}</strong> started.`);
+                
+                // Start polling for the job status.
+                poll_for_job_completion(job_id, (result) => {
+                    frappe.show_alert({
+                        message: `Optimization for ${frm.doc.name} complete. The required quantities have been updated.`,
+                        indicator: 'green'
+                    }, 10);
+                    frm.reload_doc(); // Refresh the SO to show new quantities and attachments.
+                });
+            } else {
                 frappe.msgprint({
-                    title: __('Error Starting Job'),
+                    title: __('Error'),
                     indicator: 'red',
-                    message: __('Could not start the optimization background job. Please check the Error Log.')
+                    message: __('Failed to start optimization job. Please check the Error Log.')
                 });
             }
         }
     });
-} 
+}
+
+/**
+ * Polls the backend every few seconds to check the status of the background job.
+ * @param {string} job_id - The ID of the job to poll.
+ * @param {function} on_complete_callback - Function to execute when the job is finished successfully.
+ */
+function poll_for_job_completion(job_id, on_complete_callback) {
+    const poll_interval = 4000; // 4 seconds
+
+    const poller = setInterval(() => {
+        frappe.call({
+            method: 'example_app.erpnextcutting_optimizer.api.get_job_result',
+            args: {
+                job_id: job_id
+            },
+            callback: (r) => {
+                if (r.message) {
+                    const job = r.message;
+                    if (job.status === 'finished') {
+                        clearInterval(poller);
+                        on_complete_callback(job.output);
+
+                    } else if (job.status === 'failed') {
+                        clearInterval(poller);
+                        console.error("Job Failed:", job.error);
+                        frappe.msgprint({
+                            title: __('Optimization Failed'),
+                            indicator: 'red',
+                            message: `Job ${job_id} failed. Please check the Error Log for details.`
+                        });
+                    }
+                    // If status is 'queued' or 'started', do nothing and wait for the next poll.
+                }
+            }
+        });
+    }, poll_interval);
+}
